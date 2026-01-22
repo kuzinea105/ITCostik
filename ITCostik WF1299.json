@@ -1,0 +1,862 @@
+{
+  "name": "ITCostik",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "Assistbot",
+        "options": {
+          "noResponseBody": true
+        }
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -192,
+        0
+      ],
+      "id": "c077aa24-ae59-4233-884b-db2fcea54340",
+      "name": "Webhook",
+      "webhookId": "17ce2013-e3a9-4a97-9d05-7e0d590d989f"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract message — FULL REPLACE v3 (adds audio detection + hasAudio)\n// Input: $json.body.updates[0]\n// Output: { text, chatId, login, hasFile, hasAudio, files[] }\n\nfunction normalizeText(s) {\n  return String(s || '').replace(/\\u00A0/g, ' ').trim();\n}\n\nfunction toArrayMaybe(x) {\n  if (!x) return [];\n  if (Array.isArray(x)) return x;\n  return [x];\n}\n\nfunction uniqPushFile(arr, f) {\n  const kind = String(f.kind || '');\n  const id = String(f.file_id || f.id || '');\n  const key = `${kind}|${id}`;\n  if (!id) return;\n  if (arr._seen && arr._seen.has(key)) return;\n  arr._seen = arr._seen || new Set();\n  arr._seen.add(key);\n  arr.push(f);\n}\n\nfunction guessKindByName(name) {\n  const n = String(name || '').toLowerCase();\n  if (/\\.(png|jpg|jpeg|bmp|gif|tif|tiff|webp)$/i.test(n)) return 'image';\n  if (/\\.(ogg|opus|mp3|wav|m4a|aac|flac)$/i.test(n)) return 'audio';\n  return 'file';\n}\n\nconst update = $json?.body?.updates?.[0];\nif (!update) return [];\n\nconst text = normalizeText(update.text || '') || 'Empty';\n\n// chatId/login\nconst chatId = update?.from?.id ?? update?.chat?.id ?? null;\nconst login = update?.from?.login ?? null;\n\nconst files = [];\n\n// images can come in different shapes: images[0] array, images array, or object\nconst imagesRaw = update.images;\nif (imagesRaw) {\n  // sometimes images is [[...]] or [...]\n  const imgs = Array.isArray(imagesRaw) && Array.isArray(imagesRaw[0]) ? imagesRaw[0] : imagesRaw;\n  for (const src of toArrayMaybe(imgs)) {\n    if (!src) continue;\n    const file_id = src.file_id || src.id;\n    uniqPushFile(files, {\n      kind: 'image',\n      file_id,\n      name: src.name || '',\n      size: src.size,\n      width: src.width,\n      height: src.height,\n    });\n  }\n}\n\n// generic file (docs, logs, voice, etc)\nif (update.file) {\n  const f = update.file;\n  const file_id = f.file_id || f.id;\n  const name = f.name || '';\n  const kind = guessKindByName(name);\n  uniqPushFile(files, {\n    kind,\n    file_id,\n    name,\n    size: f.size,\n  });\n}\n\nconst hasFile = files.length > 0;\nconst hasAudio = files.some(f => String(f.kind).toLowerCase() === 'audio');\n\nreturn [{\n  json: {\n    text,\n    chatId,\n    login,\n    hasFile,\n    hasAudio,\n    files,\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -32,
+        0
+      ],
+      "id": "9b332455-695a-494d-8a8c-dbe3ae751c15",
+      "name": "Extract message"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prepare reply (n8n Code node, JS) — FULL REPLACE v4.1-chat-cleanlogs + corp-search-json-unpack\n// supports Ollama /api/chat and /api/generate\n// - CSV/Excel > TXT (forced for log parsing) > plain text\n// - If wantsLogParsing OR model includes deepseek-logs/granite-logs => ALWAYS send TXT file\n// - When NO file is sent, split sendText into chunks (Yandex limit 6000)\n// - For log parsing: strips <think>...</think> and tries to keep ONLY 4 required sections\n// - NEW: Unpacks corp-search agent JSON: {\"action\":\"final\",\"answer\":\"...\"} (robust to literal newlines in strings)\n\nconst inItems = $input.all();\n\nconst YM_MAX = 6000;\nconst YM_SAFE = 5800;\n\nfunction normalizeChatId(chatId) {\n  if (!chatId) return null;\n  const s = String(chatId).trim();\n  if (!s) return null;\n  return s.includes('/') ? s : `0/0/${s}`;\n}\n\nfunction safeGetFromNode(nodeName) {\n  try {\n    const arr = $items(nodeName);\n    return arr && arr[0] && arr[0].json ? arr[0].json : {};\n  } catch {\n    return {};\n  }\n}\n\nfunction extractFencedBlock(str, lang) {\n  if (!str || typeof str !== 'string') return null;\n  const re = new RegExp(\"```\" + lang + \"\\\\s*([\\\\s\\\\S]*?)```\", \"i\");\n  const m = str.match(re);\n  return m ? (m[1] || '').trim() : null;\n}\n\nfunction firstNonEmptyLine(str) {\n  if (!str) return '';\n  const lines = String(str).split(/\\r?\\n/);\n  for (const l of lines) {\n    const t = l.trim();\n    if (t) return t;\n  }\n  return '';\n}\n\nfunction toSafeBaseName(s, fallback) {\n  const raw = (s || '').toString().trim();\n  const base = raw.slice(0, 80) || fallback;\n  return (base\n    .replace(/[\\\\/:*?\"<>|]+/g, ' ')\n    .replace(/\\s+/g, ' ')\n    .trim()\n    .slice(0, 80)) || fallback;\n}\n\n// Better: strip \"Attached files:\" tail before extracting last message\nfunction getPromptText() {\n  const leaderMeta = safeGetFromNode('Prepare prompt & leader');\n  return (leaderMeta && leaderMeta.prompt) ? String(leaderMeta.prompt) : '';\n}\n\nfunction stripAttachedFilesTail(promptText) {\n  const p = String(promptText || '');\n  const idx = p.indexOf('\\n\\nAttached files:');\n  return idx >= 0 ? p.slice(0, idx) : p;\n}\n\nfunction extractLastUserMessage(promptText) {\n  const p0 = stripAttachedFilesTail(promptText);\n  if (!p0) return '';\n  const re = /Message\\s+#\\d+\\s*\\([^)]+\\):\\s*([\\s\\S]*?)(?=\\nMessage\\s+#\\d+\\s*\\(|$)/g;\n  let m, last = '';\n  while ((m = re.exec(p0)) !== null) {\n    const t = (m[1] || '').trim();\n    if (t && t !== 'Empty') last = t;\n  }\n  return last || '';\n}\n\nfunction wantsCsvOrExcel(userText) {\n  if (!userText) return false;\n  return /(excel|эксель|xlsx|таблиц(у|а)\\s*excel|в\\s*excel|csv|в\\s*csv|формат(е)?\\s*csv|переведи\\s+в\\s+excel|переведи\\s+в\\s+таблицу)/i\n    .test(userText);\n}\n\nfunction wantsTxt(userText) {\n  if (!userText) return false;\n  return /(txt|тхт|текстов(ый|ом)\\s+файл|в\\s*txt|в\\s*тхт|формат(е)?\\s*txt|пришли\\s+текстом|лог(и)?\\s+текстом|в\\s*виде\\s+текста)/i\n    .test(userText);\n}\n\n// CSV even if not fenced\nfunction extractLooseCsv(rawText) {\n  if (!rawText || typeof rawText !== 'string') return null;\n  const text = rawText.replace(/\\r/g, '');\n\n  const idx = text.toLowerCase().indexOf('csv');\n  if (idx !== -1) {\n    const after = text.slice(idx + 3).trimStart();\n    const candidate = after.replace(/^[\\s:—-]+/, '').trim();\n    const lines = candidate.split('\\n').map(l => l.trim()).filter(Boolean);\n    if (lines.length >= 2 && lines[0].includes(';')) return candidate.trim();\n  }\n\n  const lines = text.split('\\n');\n  const csvLines = [];\n  for (const l of lines) {\n    const t = l.trim();\n    if (!t) continue;\n    if (t.includes(';') && t.split(';').length >= 2) {\n      csvLines.push(t);\n    } else if (csvLines.length) {\n      break;\n    }\n  }\n  if (csvLines.length >= 2) return csvLines.join('\\n').trim();\n  return null;\n}\n\nfunction guessSourceFileName(leaderMeta) {\n  const files = Array.isArray(leaderMeta?.files) ? leaderMeta.files : [];\n  if (!files.length) return null;\n\n  const nonImage = files.find(f => {\n    const name = String(f?.name || '').toLowerCase();\n    const kind = String(f?.kind || '').toLowerCase();\n    const isImgKind = kind === 'image';\n    const isImgExt = /\\.(png|jpg|jpeg|bmp|gif|tif|tiff|webp)$/i.test(name);\n    return !(isImgKind || isImgExt);\n  });\n\n  const chosen = nonImage || files[0];\n  const n = (chosen && chosen.name) ? String(chosen.name).trim() : null;\n  return n || null;\n}\n\nfunction splitForYandex(text, maxLen = YM_SAFE) {\n  const s = String(text || '');\n  if (s.length <= YM_MAX) return [s];\n\n  const parts = [];\n  let i = 0;\n\n  while (i < s.length) {\n    let end = Math.min(i + maxLen, s.length);\n\n    const nl = s.lastIndexOf('\\n', end);\n    if (nl > i + Math.floor(maxLen * 0.6)) end = nl + 1;\n\n    if (end <= i) end = Math.min(i + maxLen, s.length);\n\n    parts.push(s.slice(i, end));\n    i = end;\n  }\n\n  const total = parts.length;\n  return parts.map((p, idx) => {\n    const prefix = `(${idx + 1}/${total}) `;\n    const room = YM_MAX - prefix.length;\n    return prefix + (p.length > room ? p.slice(0, room) : p);\n  });\n}\n\n// Helper: parse JSON string if Ollama response got stringified\nfunction tryParseJsonString(s) {\n  const t = (typeof s === 'string') ? s.trim() : '';\n  if (!t) return null;\n  if (!(t.startsWith('{') || t.startsWith('['))) return null;\n  try { return JSON.parse(t); } catch { return null; }\n}\n\n// Helper: pull assistant text from Ollama /api/chat or /api/generate\nfunction extractAssistantText(llm) {\n  if (!llm || typeof llm !== 'object') return '';\n\n  // sometimes response is a JSON string\n  const asJson = tryParseJsonString(llm.response) || tryParseJsonString(llm.text) || null;\n  if (asJson && typeof asJson === 'object') llm = asJson;\n\n  // /api/generate\n  if (typeof llm.response === 'string') return llm.response;\n\n  // /api/chat\n  if (typeof llm?.message?.content === 'string') return llm.message.content;\n\n  // n8n nesting variants\n  if (typeof llm?.body?.message?.content === 'string') return llm.body.message.content;\n  if (typeof llm?.data?.message?.content === 'string') return llm.data.message.content;\n\n  // fallbacks\n  if (typeof llm.text === 'string') return llm.text;\n  if (typeof llm.answer === 'string') return llm.answer;\n\n  return '';\n}\n\n// Remove DeepSeek \"thinking\"\nfunction stripThinking(raw) {\n  let t = String(raw || '');\n\n  // common tags\n  t = t.replace(/<think>[\\s\\S]*?<\\/think>/gi, '').trim();\n\n  // some variants\n  t = t.replace(/^\\s*thinking\\s*:\\s*[\\s\\S]*?\\n(?=\\S)/i, '').trim();\n\n  return t.trim();\n}\n\n// Keep ONLY the 4-section report if present (your Modelfile format)\nfunction extractStrict4Sections(text) {\n  const t = String(text || '');\n\n  const mStart = t.match(/(^|\\n)\\s*1\\)\\s*Parser metadata\\s*:/i);\n  const mEnd = t.match(/(^|\\n)\\s*4\\)\\s*Errors\\s*\\(.*?\\)\\s*:/i); // your header can be long\n  if (!mStart || !mEnd) return null;\n\n  const startIdx = mStart.index + (mStart[1] ? mStart[1].length : 0);\n\n  let sliced = t.slice(startIdx).trim();\n  return sliced.trim();\n}\n\n// ===== NEW: robust unpack of corp-search agent JSON =====\nfunction repairJsonNewlinesInStrings(src) {\n  const s = String(src || '');\n  let out = '';\n  let inStr = false;\n  let esc = false;\n\n  for (let i = 0; i < s.length; i++) {\n    const ch = s[i];\n\n    if (esc) { out += ch; esc = false; continue; }\n    if (ch === '\\\\') { out += ch; esc = true; continue; }\n    if (ch === '\"') { out += ch; inStr = !inStr; continue; }\n\n    if (inStr && ch === '\\n') { out += '\\\\n'; continue; }\n    if (inStr && ch === '\\r') { continue; }\n\n    out += ch;\n  }\n  return out;\n}\n\nfunction extractJsonLoose(text) {\n  const t0 = String(text || '').trim()\n    .replace(/^```json\\s*/i, '')\n    .replace(/^```\\s*/i, '')\n    .replace(/```$/i, '')\n    .trim();\n\n  const candidates = [t0];\n  const m = t0.match(/\\{[\\s\\S]*\\}/);\n  if (m) candidates.push(m[0]);\n\n  for (const c of candidates) {\n    try { return JSON.parse(c); } catch {}\n    try { return JSON.parse(repairJsonNewlinesInStrings(c)); } catch {}\n  }\n  return null;\n}\n\nfunction tryUnpackCorpAgentJson(replyText) {\n  const t = String(replyText || '').trim();\n  if (!t.startsWith('{')) return null;\n  if (!t.includes('\"action\"')) return null;\n\n  const obj = extractJsonLoose(t);\n  if (!obj || typeof obj !== 'object') return null;\n\n  if (obj.action === 'final' && typeof obj.answer === 'string' && obj.answer.trim()) {\n    return obj.answer.trim();\n  }\n\n  // If somehow we received action=search in final stage, show a readable message\n  if (obj.action === 'search' && typeof obj.query === 'string' && obj.query.trim()) {\n    return `Требуется дополнительный поиск по запросу: ${obj.query.trim()}`;\n  }\n\n  return null;\n}\n\nreturn inItems.flatMap((itm) => {\n  const llm = itm.json || {};\n\n  let rawText = extractAssistantText(llm);\n  rawText = rawText || '';\n  let replyText = rawText.trim() ? rawText : 'Model returned empty response.';\n\n  const leaderMeta = safeGetFromNode('Prepare prompt & leader');\n  const inputMeta = itm.json || {};\n  const srcMeta = safeGetFromNode('Add OCR to prompt'); // optional\n\n  const chatId =\n    srcMeta.chatId ??\n    leaderMeta.chatId ??\n    inputMeta.chatId ??\n    inputMeta.chat_id ??\n    llm.chatId ??\n    llm.chat_id ??\n    null;\n\n  const login =\n    srcMeta.login ??\n    leaderMeta.login ??\n    inputMeta.login ??\n    llm.login ??\n    null;\n\n  const chat_id = normalizeChatId(chatId);\n\n  const promptText = getPromptText();\n  const lastUserText = extractLastUserMessage(promptText);\n\n  // Intents\n  const wantsLogParsing = !!leaderMeta?.wantsLogParsing;\n  const modelName = String(llm?.model || leaderMeta?.model || '').toLowerCase();\n\n  // Force TXT for log parsing models or flag\n  const forceTxt =\n    wantsLogParsing ||\n    modelName.includes('deepseek-logs') ||\n    modelName.includes('granite-logs');\n\n  // NEW: unpack corp-search JSON protocol to plain answer text (safe, no effect on normal replies)\n  const unpacked = tryUnpackCorpAgentJson(replyText);\n  if (unpacked) replyText = unpacked;\n\n  // For logs we NEVER switch to CSV even if user mentioned Excel somewhere\n  const needCsv = !forceTxt && wantsCsvOrExcel(lastUserText);\n\n  const needTxt = !needCsv && (forceTxt || wantsTxt(lastUserText));\n\n  // Strip thinking for log parsing (and generally safe)\n  if (forceTxt) {\n    replyText = stripThinking(replyText);\n    const strict = extractStrict4Sections(replyText);\n    if (strict) replyText = strict;\n  }\n\n  // Blocks\n  const csvBlock = extractFencedBlock(replyText, 'csv');\n  const txtBlock =\n    extractFencedBlock(replyText, 'txt') ||\n    extractFencedBlock(replyText, 'text') ||\n    extractFencedBlock(replyText, 'plaintext');\n\n  // === CSV ===\n  let csvContent = null;\n  let csvFileName = 'table.csv';\n\n  if (needCsv) {\n    const fromFenced = csvBlock && csvBlock.trim() ? csvBlock.trim() : null;\n    const fromLoose = extractLooseCsv(replyText);\n    csvContent = fromFenced || fromLoose;\n\n    if (csvContent) {\n      const firstLine = firstNonEmptyLine(csvContent);\n      const cells = firstLine.split(/[;]/).map(c => c.trim()).filter(Boolean);\n      const rawName = cells[1] || cells[0] || 'table';\n      csvFileName = `${toSafeBaseName(rawName, 'table')}.csv`;\n    }\n  }\n\n  // === TXT ===\n  let txtContent = null;\n  let txtFileName = 'result.txt';\n\n  if (needTxt) {\n    txtContent = (txtBlock && txtBlock.trim()) ? txtBlock.trim() : replyText.trim();\n\n    const srcName = guessSourceFileName(leaderMeta);\n    if (srcName) {\n      txtFileName = `${toSafeBaseName(srcName, 'result')}.txt`;\n    } else {\n      const firstLine = firstNonEmptyLine(txtContent);\n      txtFileName = `${toSafeBaseName(firstLine, 'result')}.txt`;\n    }\n  }\n\n  // === OUTPUT ===\n  if (csvContent) {\n    const buff = Buffer.from('\\uFEFF' + csvContent, 'utf8'); // BOM for Excel\n    return [{\n      json: {\n        chatId,\n        chat_id,\n        login,\n        text: 'Готово! Отправляю CSV-файл.',\n        needCsv,\n        needTxt,\n        forceTxt,\n        wantsLogParsing,\n        lastUserText,\n        hasCsv: true,\n        hasTxt: false,\n        csvFileName,\n        txtFileName,\n        originalResponse: rawText,\n      },\n      binary: { file: { data: buff.toString('base64'), fileName: csvFileName, mimeType: 'text/csv' } },\n    }];\n  }\n\n  if (txtContent) {\n    const buff = Buffer.from(txtContent, 'utf8');\n    return [{\n      json: {\n        chatId,\n        chat_id,\n        login,\n        text: 'Готово! Отправляю TXT-файл.',\n        needCsv,\n        needTxt,\n        forceTxt,\n        wantsLogParsing,\n        lastUserText,\n        hasCsv: false,\n        hasTxt: true,\n        csvFileName,\n        txtFileName,\n        originalResponse: rawText,\n      },\n      binary: { file: { data: buff.toString('base64'), fileName: txtFileName, mimeType: 'text/plain; charset=utf-8' } },\n    }];\n  }\n\n  // If no file: split sendText\n  const parts = splitForYandex(replyText, YM_SAFE);\n  return parts.map((p) => ({\n    json: {\n      chatId,\n      chat_id,\n      login,\n      text: p,\n      needCsv,\n      needTxt,\n      forceTxt,\n      wantsLogParsing,\n      lastUserText,\n      hasCsv: false,\n      hasTxt: false,\n    },\n  }));\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2896,
+        -16
+      ],
+      "id": "b860b880-b6a0-4afd-8a1b-b58748be0913",
+      "name": "Prepare reply"
+    },
+    {
+      "parameters": {
+        "amount": 20
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        288,
+        0
+      ],
+      "id": "d5b96036-92ed-4187-9593-8a1982fffc74",
+      "name": "Wait",
+      "webhookId": "d89b29dc-d93c-4f44-8766-ea98ff8bfebb"
+    },
+    {
+      "parameters": {
+        "dataTableId": {
+          "__rl": true,
+          "value": "64Y6oJPQRzpKmBIv",
+          "mode": "list",
+          "cachedResultName": "Yandex_messages",
+          "cachedResultUrl": "/projects/NzQv03hxe8w3kPzF/datatables/64Y6oJPQRzpKmBIv"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "processed": false,
+            "chatId": "={{$json.chatId}}",
+            "timestamp": "={{Date.now()}}",
+            "text": "={{$json.text}}",
+            "files": "={{ JSON.stringify($json.files || []) }}",
+            "login": "={{$json.login}}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "chatId",
+              "displayName": "chatId",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "timestamp",
+              "displayName": "timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "text",
+              "displayName": "text",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "processed",
+              "displayName": "processed",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "files",
+              "displayName": "files",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "login",
+              "displayName": "login",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {
+          "optimizeBulk": false
+        }
+      },
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1,
+      "position": [
+        144,
+        0
+      ],
+      "id": "02687508-5d82-40fb-a681-e8678246d57e",
+      "name": "Data message"
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "64Y6oJPQRzpKmBIv",
+          "mode": "list",
+          "cachedResultName": "Yandex_messages",
+          "cachedResultUrl": "/projects/NzQv03hxe8w3kPzF/datatables/64Y6oJPQRzpKmBIv"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "chatId",
+              "keyValue": "={{$json.chatId}}"
+            },
+            {
+              "keyName": "processed",
+              "condition": "isFalse"
+            }
+          ]
+        },
+        "returnAll": true
+      },
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1,
+      "position": [
+        496,
+        0
+      ],
+      "id": "10372932-4f78-47af-8665-dcf1d01b0886",
+      "name": "Read messages"
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "dataTableId": {
+          "__rl": true,
+          "value": "64Y6oJPQRzpKmBIv",
+          "mode": "list",
+          "cachedResultName": "Yandex_messages",
+          "cachedResultUrl": "/projects/NzQv03hxe8w3kPzF/datatables/64Y6oJPQRzpKmBIv"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "chatId",
+              "keyValue": "={{$json.chatId}}"
+            },
+            {
+              "keyName": "processed",
+              "condition": "isFalse"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "processed": true
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "chatId",
+              "displayName": "chatId",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": true
+            },
+            {
+              "id": "timestamp",
+              "displayName": "timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": true
+            },
+            {
+              "id": "text",
+              "displayName": "text",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": true
+            },
+            {
+              "id": "processed",
+              "displayName": "processed",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "files",
+              "displayName": "files",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": true
+            },
+            {
+              "id": "login",
+              "displayName": "login",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1,
+      "position": [
+        1408,
+        -256
+      ],
+      "id": "b4b5a342-1c68-44c1-8507-268507d949a2",
+      "name": "Update row(s)",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "9762fa70-8640-4f1b-9966-3e747cacf98f",
+              "leftValue": "={{$json[\"isLeader\"]}}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1008,
+        0
+      ],
+      "id": "c21b8fa4-7402-4098-953b-b18bd4eda564",
+      "name": "If  leader"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Code node \"Stop\"\n// Ничего не делаем и останавливаем цепочку для этих сообщений\nreturn [];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1296,
+        384
+      ],
+      "id": "a4df5d99-e1d7-4a08-b988-dd7ae058f6de",
+      "name": "Stop"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prepare prompt & leader — FULL REPLACE v12-corp-only\n// - агрегирует сообщения из DataTable\n// - определяет leader (последний по timestamp)\n// - собирает files[] корректно\n// - ВСЕГДА выбирает модель: corp-assistant:latest\n// - prompt (debug) с нумерацией Message #1..N\n// - wantsLogParsing всегда false (ветка лог-парсинга вынесена в отдельный WF)\n\nfunction toTs(row) {\n  const t = Number(row?.timestamp);\n  return Number.isFinite(t) ? t : 0;\n}\n\nfunction parseFiles(value) {\n  if (!value) return [];\n  if (Array.isArray(value)) return value;\n\n  if (typeof value === 'string') {\n    try {\n      const parsed = JSON.parse(value);\n      return Array.isArray(parsed) ? parsed : [];\n    } catch (_) {\n      return [];\n    }\n  }\n  return [];\n}\n\nfunction isImageFile(f) {\n  const kind = String(f?.kind || '').toLowerCase();\n  if (kind === 'image') return true;\n\n  const name = String(f?.name || '').toLowerCase();\n  return /\\.(png|jpg|jpeg|bmp|gif|tif|tiff|webp)$/i.test(name);\n}\n\nfunction normalizeText(x) {\n  return String(x || '').replace(/\\u00A0/g, ' ').trim();\n}\n\n// ========== 1) Input rows ==========\nconst rows = $input.all().map(item => item.json);\nif (!rows.length) return [];\n\n// ========== 2) myId from Wait ==========\nconst waitItems = $items('Wait');\nconst myRow = waitItems && waitItems[0] ? waitItems[0].json : null;\nconst myId = myRow && myRow.id != null ? myRow.id : null;\n\n// ========== 3) sort and leader ==========\nconst sorted = rows.slice().sort((a, b) => toTs(a) - toTs(b));\nconst leaderRow = sorted[sorted.length - 1] || null;\nconst leaderId = leaderRow && leaderRow.id != null ? leaderRow.id : null;\nconst isLeader = myId != null && leaderId != null && myId === leaderId;\n\n// ========== 4) collect files (with msg refs) ==========\nlet files = [];\nfor (const row of rows) {\n  const rowFiles = parseFiles(row.files).map(f => ({\n    ...(f && typeof f === 'object' ? f : {}),\n    _msgId: row.id,\n    _msgTimestamp: toTs(row),\n  }));\n  files = files.concat(rowFiles);\n}\nfiles = files.filter(f => f && typeof f === 'object');\n\nconst hasFile = files.length > 0;\nconst hasImage = files.some(isImageFile);\nconst hasNonImage = hasFile && files.some(f => !isImageFile(f));\n\n// ========== 5) model (corp only) ==========\nconst model = 'corp-assistant:latest';\nconst modelSelectedBy = 'forced:corp';\n\n// If user explicitly asks for TXT\nconst allUserTextRaw = normalizeText(sorted.map(r => String(r.text || '')).join('\\n'));\nconst wantsTxt = /(в\\s*формате\\s*txt|формат\\s*txt|\\btxt\\b)/i.test(allUserTextRaw);\n\n// ========== 6) base prompt (debug/history only) ==========\nconst promptParts = sorted.map((row, idx) => {\n  const tsNum = toTs(row);\n  const tsStr = tsNum ? new Date(tsNum).toISOString() : (row.createdAt || '');\n  const text = row.text && String(row.text).trim() !== '' ? String(row.text) : 'Empty';\n  // NOTE: numbering starts from 1\n  return `Message #${idx + 1} (${tsStr}): ${text}`;\n});\n\nlet prompt = promptParts.join('\\n');\n\nif (hasFile) {\n  const fileLines = files.map((f, i) => {\n    const kind = f.kind || 'file';\n    const id = f.file_id || f.id || '';\n    const name = f.name || '';\n    const size = f.size != null ? String(f.size) : '';\n    return `File #${i + 1}: [${kind}] name=\"${name}\", id=\"${id}\", size=${size}`;\n  });\n  prompt += '\\n\\nAttached files:\\n' + fileLines.join('\\n');\n}\n\n// last user text (useful for downstream compose/search)\nconst lastUserText =\n  normalizeText(leaderRow?.text || '') ||\n  normalizeText(sorted[sorted.length - 1]?.text || '');\n\nreturn [\n  {\n    json: {\n      model,\n      modelSelectedBy,\n      prompt,\n\n      chatId: leaderRow ? leaderRow.chatId : (myRow ? myRow.chatId : null),\n      login: leaderRow ? leaderRow.login : (myRow ? myRow.login : null),\n\n      hasFile,\n      hasImage,\n      hasNonImage,\n      files,\n\n      // log parsing branch removed in this WF:\n      wantsLogParsing: false,\n      wantsTxt,\n\n      // helps Corp Search Agent (iterative) be stable:\n      lastUserText,\n      searchQuery: lastUserText,\n\n      isLeader,\n      myId,\n      leaderId,\n    },\n  },\n];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        688,
+        0
+      ],
+      "id": "42734b49-530c-4adc-a2e8-f6f1ee3a448d",
+      "name": "Prepare prompt & leader"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prepare files for OCR — choose ORIGINAL / max resolution (stable v2)\n// Fixes:\n// - leaderId/_msgId compare is type-safe (string)\n// - more defensive checks\n// Output fields used by \"OCR Request\": file_id, file_name, file_kind\n\nconst item = $input.item.json;\n\nconst allFiles = Array.isArray(item.files) ? item.files : [];\nconst leaderId = item.leaderId ?? null;\n\nfunction isImageFile(f) {\n  if (!f || typeof f !== 'object') return false;\n  const kind = String(f.kind || '').toLowerCase();\n  if (kind === 'image') return true;\n  const name = String(f.name || '').toLowerCase();\n  return /\\.(png|jpg|jpeg|bmp|gif|tif|tiff|webp)$/i.test(name);\n}\n\nfunction cleanId(id) {\n  return id ? String(id) : '';\n}\n\nfunction scoreImage(f) {\n  const w = Number(f.width) || 0;\n  const h = Number(f.height) || 0;\n  const area = w * h;\n\n  const id = cleanId(f.file_id || f.id);\n  const isOriginal = id.includes('?') ? 0 : 1; // без ?size=... обычно лучше\n  const hasName = f.name ? 1 : 0;\n\n  return (isOriginal * 1e12) + (area * 1e3) + hasName;\n}\n\n// 1) кандидаты-изображения\nlet candidates = allFiles.filter(isImageFile);\n\n// 2) если есть leaderId — предпочитаем изображения из сообщения-лидера\nif (leaderId != null) {\n  const lid = String(leaderId);\n  const fromLeader = candidates.filter(f => String(f?._msgId ?? '') === lid);\n  if (fromLeader.length > 0) candidates = fromLeader;\n}\n\n// 3) если нет изображений — skip\nif (candidates.length === 0) {\n  return [{\n    json: {\n      ...item,\n      _skipOcr: true,\n      file_id: '',\n      file_name: '',\n      file_kind: '',\n      ocrSourceMsgId: null,\n      _ocrChosen: null,\n    },\n  }];\n}\n\n// 4) выбрать лучшую картинку\ncandidates.sort((a, b) => scoreImage(a) - scoreImage(b));\nconst best = candidates[candidates.length - 1];\n\nconst bestId = best.file_id || best.id || '';\n\nreturn [{\n  json: {\n    ...item,\n    _skipOcr: false,\n    file_id: bestId,\n    file_name: best.name || '',\n    file_kind: best.kind || 'image',\n    ocrSourceMsgId: best._msgId ?? null,\n    _ocrChosen: {\n      file_id: bestId,\n      width: best.width,\n      height: best.height,\n      name: best.name || '',\n    },\n  },\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1648,
+        -144
+      ],
+      "id": "0a14a72a-9f5f-4c6e-acd8-c32b5e8166b7",
+      "name": "Prepare files for OCR"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge OCR results — robust v3 (FULL REPLACE)\n// - Do NOT treat missing ok as success\n// - Surface upstream errors\n// - Treat empty OCR as failure\n\nconst items = $input.all().map(i => i.json);\n\nif (!items.length) {\n  return [{ json: { ok: false, ocr_text: '', files: [], note: '[ocr] no results' } }];\n}\n\nfunction pickText(res) {\n  const t = (res.ocr_text ?? res.text ?? '').toString().trim();\n  return t;\n}\nfunction pickOk(res) {\n  return res?.ok === true;\n}\nfunction pickErr(res) {\n  return (res?.error_data || res?.error || '').toString().trim();\n}\n\nlet allOk = true;\nconst parts = [];\nconst files = [];\n\nfor (const res of items) {\n  const name = (res.file_name || res.file_id || res.id || '(no-name)').toString().trim() || '(no-name)';\n  const text = pickText(res);\n  const ok = pickOk(res) && text.length > 0;\n  const err = pickErr(res);\n\n  if (!ok) allOk = false;\n\n  files.push({ name, ok, text, err, debug: res.ocr_debug || null });\n\n  if (text) parts.push(`Файл \"${name}\":\\n${text}`);\n  else if (err) parts.push(`Файл \"${name}\":\\n[OCR ERROR]\\n${err}`);\n  else parts.push(`Файл \"${name}\":\\n[OCR] Empty result (text not recognized).`);\n}\n\nreturn [{ json: { ok: allOk, ocr_text: parts.join('\\n\\n'), files } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1984,
+        -144
+      ],
+      "id": "48b0e50a-db79-428a-a958-c358fb0d7b9e",
+      "name": "Merge OCR results"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://botapi.messenger.yandex.net/bot/v1/messages/sendText/",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "OAuth y0__xCN2O3DCBiWkRMgo_u6yRUNy2r1mXTIvHoIl7pOZ_Dm-bnMMg"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "login",
+              "value": "={{$json.login}}"
+            },
+            {
+              "name": "text",
+              "value": "={{$json.text}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        3504,
+        112
+      ],
+      "id": "1d1c3f85-e784-4afa-86a4-7c5e77dba9de",
+      "name": "Send Text"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://botapi.messenger.yandex.net/bot/v1/messages/sendFile/",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "OAuth y0__xCN2O3DCBiWkRMgo_u6yRUNy2r1mXTIvHoIl7pOZ_Dm-bnMMg"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "login",
+              "value": "={{$json.login}}"
+            },
+            {
+              "parameterType": "formBinaryData",
+              "name": "document",
+              "inputDataFieldName": "file"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        3504,
+        -112
+      ],
+      "id": "cd47ebb7-e7a0-4b41-9820-3c452e56b2a8",
+      "name": "Send file"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "15527451-ad55-4b9e-a7e4-5db6dfdfe946",
+              "leftValue": "={{ !!$binary.file }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3200,
+        -16
+      ],
+      "id": "39e1ee75-3b33-4873-b398-43013e9403e1",
+      "name": "If file"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "36faeef7-d542-4c14-bf69-9c8d27e60531",
+              "leftValue": "={{ $json.hasImage === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1408,
+        -16
+      ],
+      "id": "156bc21c-0f30-4743-9848-428199fdfeb9",
+      "name": "Files go OCR"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Corp Search Agent — FULL REPLACE v2.0 (year-split comparison, 7-10 sources, RU-only readable list)\n// - No action=search at all.\n// - For \"compare year1 vs year2\" questions: runs multiple searches (year1, year2 + targeted laws) to reduce missing facts.\n// - Output: readable \"table-as-list\" (no CSV, no markdown tables) + in-text [#x.y] citations.\n// - Sources: MUST be 7–10 lines, annotated: \"#1.3 — short label — URL\".\n// - RU-only output (English terms allowed in parentheses). Any other scripts -> rewrite.\n//\n// Env: YANDEX_SEARCH_API_KEY, YANDEX_SEARCH_FOLDER_ID, OLLAMA_URL\n// Optional env: CORP_SEARCH_TOPK (default 10), CORP_SEARCH_EVIDENCE_CHARS (default 80000)\n//              CORP_ANSWER_MIN_CHARS (default 2200), CORP_ANSWER_MAX_CHARS (default 12000)\n\nfunction stripTags(s) { return String(s || '').replace(/<[^>]+>/g, ''); }\nfunction decodeXmlEntities(s) {\n  return String(s || '')\n    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')\n    .replace(/&quot;/g, '\"').replace(/&#39;/g, \"'\");\n}\n\nfunction isRu(q){ return /[А-Яа-яЁё]/.test(String(q||'')); }\nfunction detectSearchType(q){ return isRu(q) ? 'SEARCH_TYPE_RU' : 'SEARCH_TYPE_COM'; }\nfunction detectL10n(q){ return isRu(q) ? 'LOCALIZATION_RU' : 'LOCALIZATION_EN'; }\n\nfunction cleanQuery(q){\n  let t = String(q||'').trim().replace(/\\s+/g,' ').trim();\n  if (t.length > 380) t = t.slice(0,380).trim();\n  return t;\n}\n\nfunction isIdentityQuestion(q){\n  const t = String(q||'').toLowerCase();\n  return /(кто\\s+ты|как\\s+тебя\\s+зовут|как\\s+тво[её]\\s+имя|кто\\s+тебя\\s+создал|что\\s+ты\\s+умеешь|itcostik\\s+кто)/i.test(t);\n}\n\nfunction looksLikeComparison(q){\n  const t = String(q||'').toLowerCase();\n  return /(сравни|сравнение|vs|\\bпротив\\b)/i.test(t);\n}\n\nfunction extractYears(q){\n  const m = String(q||'').match(/\\b(19|20)\\d{2}\\b/g) || [];\n  const uniq = [...new Set(m)];\n  return uniq.slice(0,2);\n}\n\nfunction stripYearsAndCompareWords(q){\n  let t = String(q||'');\n  t = t.replace(/\\b(19|20)\\d{2}\\b/g, '').replace(/\\s+/g,' ').trim();\n  t = t.replace(/\\b(сравни|сравнение|vs|против)\\b/gi, '').replace(/\\s+/g,' ').trim();\n  return t;\n}\n\nfunction parseYandexXml(rawXml, topK = 10) {\n  const xml = String(rawXml || '');\n  const docs = [];\n  const docRe = /<doc\\b[^>]*>([\\s\\S]*?)<\\/doc>/g;\n  let m;\n\n  while ((m = docRe.exec(xml)) && docs.length < topK) {\n    const block = m[1];\n    const url = (block.match(/<url>([\\s\\S]*?)<\\/url>/) || [,''])[1];\n    const title = (block.match(/<title>([\\s\\S]*?)<\\/title>/) || [,''])[1];\n\n    const passages = [];\n    const passRe = /<passage>([\\s\\S]*?)<\\/passage>/g;\n    let pm;\n    while ((pm = passRe.exec(block)) && passages.length < 2) passages.push(pm[1]);\n\n    const clean = (x) => decodeXmlEntities(stripTags(x)).replace(/\\s+/g, ' ').trim();\n    const u = clean(url);\n    if (!u) continue;\n\n    docs.push({ url: u, title: clean(title), snippet: passages.map(clean).filter(Boolean).join(' ') });\n  }\n  return docs;\n}\n\nasync function yandexSearch(queryText, topK) {\n  const apiKey = $env.YANDEX_SEARCH_API_KEY;\n  const folderId = $env.YANDEX_SEARCH_FOLDER_ID;\n  if (!apiKey || !folderId) throw new Error('Missing YANDEX_SEARCH_API_KEY or YANDEX_SEARCH_FOLDER_ID');\n\n  const body = {\n    query: {\n      searchType: detectSearchType(queryText),\n      queryText: String(queryText || '').slice(0, 400),\n      familyMode: 'FAMILY_MODE_MODERATE',\n      page: '0',\n      fixTypoMode: 'FIX_TYPO_MODE_ON'\n    },\n    groupSpec: {\n      groupMode: 'GROUP_MODE_FLAT',\n      groupsOnPage: String(Math.max(1, Math.min(10, topK))),\n      docsInGroup: '1'\n    },\n    maxPassages: '2',\n    l10n: detectL10n(queryText),\n    folderId,\n    responseFormat: 'FORMAT_XML',\n    userAgent: 'ITCostik/1.0'\n  };\n\n  const resp = await this.helpers.httpRequest({\n    method: 'POST',\n    url: 'https://searchapi.api.cloud.yandex.net/v2/web/search',\n    json: true,\n    body,\n    headers: { Authorization: `Api-Key ${apiKey}`, 'Content-Type': 'application/json' },\n    timeout: 30000\n  });\n\n  let raw = resp && resp.rawData ? resp.rawData : '';\n  let xml = raw;\n\n  if (!String(raw).includes('<yandexsearch')) {\n    try { xml = Buffer.from(String(raw), 'base64').toString('utf8'); }\n    catch (_) { xml = String(raw || ''); }\n  }\n\n  return parseYandexXml(xml, topK);\n}\n\nfunction buildEvidence(searches, maxChars) {\n  const parts = [];\n  let used = 0;\n\n  for (let si = 0; si < searches.length; si++) {\n    const s0 = searches[si];\n    parts.push(`\\n=== SEARCH #${si + 1}: ${s0.query} ===\\n`);\n    for (let i = 0; i < s0.results.length; i++) {\n      const r = s0.results[i];\n      const chunk =\n        `[#${si + 1}.${i + 1}] ${r.title || '(no title)'}\\n` +\n        `${r.url}\\n` +\n        `${r.snippet || ''}\\n`;\n      if (used + chunk.length > maxChars) return parts.join('').trim();\n      parts.push(chunk);\n      used += chunk.length;\n    }\n  }\n  return parts.join('').trim();\n}\n\nasync function ollamaChat(model, prompt) {\n  const baseUrl = $env.OLLAMA_URL || 'http://127.0.0.1:11434';\n  const resp = await this.helpers.httpRequest({\n    method: 'POST',\n    url: `${baseUrl.replace(/\\/$/, '')}/api/chat`,\n    json: true,\n    body: { model, stream: false, messages: [{ role: 'user', content: String(prompt || '') }] },\n    timeout: 3600000\n  });\n  return { content: (resp?.message?.content || '') };\n}\n\nfunction hasForbiddenScript(text){\n  return /[\\u3040-\\u30ff\\u3400-\\u9fff\\uac00-\\ud7af\\u0600-\\u06ff]/.test(String(text||''));\n}\n\nfunction extractJsonLoose(text){\n  const t0 = String(text||'').trim()\n    .replace(/^```json\\s*/i,'')\n    .replace(/^```\\s*/i,'')\n    .replace(/```$/i,'')\n    .trim();\n  const m = t0.match(/\\{[\\s\\S]*\\}/);\n  const cands = [t0, m ? m[0] : ''].filter(Boolean);\n  for (const c of cands) { try { return JSON.parse(c); } catch {} }\n  return null;\n}\n\n// ===== main =====\nconst base = $json;\nif (base.model !== 'corp-assistant:latest') return [{ json: base }];\n\nconst topK = Number($env.CORP_SEARCH_TOPK || 10);\nconst evidenceMax = Number($env.CORP_SEARCH_EVIDENCE_CHARS || 80000);\nconst MIN_CHARS = Number($env.CORP_ANSWER_MIN_CHARS || 2200);\nconst MAX_CHARS = Number($env.CORP_ANSWER_MAX_CHARS || 12000);\n\nconst userQuestionRaw =\n  base.searchQuery || base.lastUserText || base.userText || base.user_text || base.text || '—';\nconst userQuestion = cleanQuery(userQuestionRaw) || '—';\nconst userContext = String(base.llm_input || base.prompt || userQuestion);\n\nif (isIdentityQuestion(userQuestion)) {\n  const { content } = await ollamaChat(base.model, `Ответь кратко по делу от лица ITCostik:\\n${userQuestion}`);\n  return [{ json: { ...base, message:{role:'assistant', content:String(content||'').trim()}, agent:{searches:[]}} }];\n}\n\n// Build searches\nlet searches = [];\nlet topic = userQuestion;\nlet y1 = null, y2 = null;\n\nconst isCmp = looksLikeComparison(userQuestion);\nconst years = extractYears(userQuestion);\n\nif (isCmp && years.length === 2) {\n  y1 = years[0];\n  y2 = years[1];\n  topic = stripYearsAndCompareWords(userQuestion);\n\n  // Year-specific base queries + targeted law/spec queries to improve coverage\n  const q2018 = cleanQuery(`${topic} ООО ОСНО ${y1} налог на прибыль НДС страховые взносы налог на имущество дивиденды`);\n  const q2026 = cleanQuery(`${topic} ООО ОСНО ${y2} налог на прибыль 25% НДС 22% страховые взносы налог на имущество дивиденды`);\n\n  const qProfit = cleanQuery(`налог на прибыль организаций ставка ${y2} 25% закон`);\n  const qVat = cleanQuery(`НДС ставка ${y2} 22% закон ФНС`);\n\n  const r1 = await yandexSearch(q2018, topK);\n  const r2 = await yandexSearch(q2026, topK);\n  const r3 = await yandexSearch(qProfit, topK);\n  const r4 = await yandexSearch(qVat, topK);\n\n  searches = [\n    { query: q2018, results: r1 },\n    { query: q2026, results: r2 },\n    { query: qProfit, results: r3 },\n    { query: qVat, results: r4 },\n  ];\n} else {\n  const r = await yandexSearch(topic, topK);\n  searches = [{ query: topic, results: r }];\n}\n\nconst evidence = buildEvidence(searches, evidenceMax);\n\nconst prompt =\n`Ты ITCostik.\nПиши строго на русском языке. Английские термины допускаются только в скобках. Любые другие языки запрещены.\n\nЕсли вопрос — сравнение по годам, НЕ смешивай годы:\n- значение для ${y1 || 'год1'} должно ссылаться на источники из поиска по ${y1 || 'год1'} (например #1.*),\n- значение для ${y2 || 'год2'} — на источники из поиска по ${y2 || 'год2'} (например #2.* или #3/#4 если там про ${y2||'год2'}).\n\nФОРМАТ ОТВЕТА (без таблиц/CSV, чтобы читалось в Yandex Messenger):\n1) Таблица-сводка (списком), 10–14 показателей (для ООО ОСНО):\n   - Налог на прибыль (ставка + важные изменения)\n   - НДС (ставка базовая + ключевые исключения кратко)\n   - Налог на имущество организаций (общая логика/ставки если есть)\n   - Дивиденды (если есть данные)\n   - Страховые взносы работодателя (суммарно/ключевые ставки если есть)\n   - Прочие существенные федеральные изменения (если есть)\n   Для каждого показателя:\n   - ${y1 || 'год1'}: <значение или N/A> [#...]\n   - ${y2 || 'год2'}: <значение или N/A> [#...]\n   - Комментарий: <что изменилось и почему (только по фактам)>\n\n2) Итоги (3–6 пунктов): перечисли реальные изменения (только где есть подтверждение).\n3) Короткий анализ (3–6 пунктов): что это значит для ООО на ОСНО (без выдуманных цифр).\n4) Источники: 7–10 строк, формат:\n   #1.6 — короткое описание — URL\n   (минимум 7, максимум 10, только реально использованные URL)\n\nЗапрещено:\n- Markdown-таблицы и CSV\n- Выдумывать ставки/цифры\n- Смешивать УСН в ответе про ОСНО\n\nОграничение длины: ${MIN_CHARS}..${MAX_CHARS} символов.\n\nOUTPUT (STRICT JSON):\n{\"action\":\"final\",\"answer\":\"...\"}\n\nСНИППЕТЫ:\n${evidence}\n`;\n\nconst { content } = await ollamaChat(base.model, prompt);\nconst obj = extractJsonLoose(content);\nlet finalAnswer = (obj && obj.action === 'final' && typeof obj.answer === 'string') ? obj.answer : String(content||'');\n\n// rewrite if forbidden scripts appear\nif (hasForbiddenScript(finalAnswer)) {\n  const rewritePrompt =\n`Перепиши ответ полностью на русском языке.\nРазрешены только русский язык и английские термины в скобках.\nСохрани структуру и 7–10 источников (с описанием).\nУдали любые символы других языков.\nОтвет верни обычным текстом (не JSON).`;\n  const { content: rewritten } = await ollamaChat(base.model, rewritePrompt + \"\\n\\n\" + finalAnswer);\n  finalAnswer = String(rewritten || '').trim();\n}\n\nreturn [{\n  json: {\n    ...base,\n    message: { role: 'assistant', content: String(finalAnswer || '').trim() },\n    agent: { searches },\n    _corpSearchDebug: { userQuestionUsed: userQuestion, searchesCount: searches.length }\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        -16
+      ],
+      "id": "3e057c88-19c3-4c4f-a034-c7ab747b69f0",
+      "name": "Corp Search Agent (iterative)"
+    },
+    {
+      "parameters": {
+        "jsCode": "// VLM Normalize (Qwen2.5-VL) — FULL REPLACE\n// Input expects: file_id (image) + file_name (optional) + ocr_text (from Merge OCR results)\n// Downloads image via Yandex getFile, sends to Ollama /api/chat with images:[base64]\n// Output: adds vlm_json + vlm_text (+debug fields)\n\nconst https = require('https');\n\nconst base = $input.item.json || {};\nconst OLLAMA_URL = (String($env.OLLAMA_URL || 'http://host.docker.internal:11434')).replace(/\\/$/, '');\nconst MODEL = 'qwen2.5vl:72b-q8_0';\n\nfunction s(x){ return x == null ? '' : String(x); }\n\nfunction httpRequestBuffer({ method, hostname, path, headers }, bodyBuf) {\n  return new Promise((resolve, reject) => {\n    const req = https.request({ method, hostname, path, headers }, (res) => {\n      const chunks = [];\n      res.on('data', (d) => chunks.push(Buffer.isBuffer(d) ? d : Buffer.from(d)));\n      res.on('end', () => resolve({ statusCode: res.statusCode || 0, headers: res.headers || {}, buf: Buffer.concat(chunks) }));\n    });\n    req.on('error', reject);\n    if (bodyBuf && bodyBuf.length) req.write(bodyBuf);\n    req.end();\n  });\n}\n\nfunction looksLikeJson(headers, buf) {\n  const ct = String(headers?.['content-type'] || '').toLowerCase();\n  if (ct.includes('application/json')) return true;\n  const b0 = buf?.slice?.(0, 1)?.toString?.('utf8') || '';\n  return b0 === '{' || b0 === '[';\n}\n\nfunction extractYandexJsonError(buf) {\n  try {\n    const obj = JSON.parse(buf.toString('utf8'));\n    if (obj && obj.ok === false) return obj.description || obj.code || 'getFile failed';\n  } catch {}\n  return null;\n}\n\nasync function yandexGetFileBuffer(fileId) {\n  const token = String($env?.YANDEX_BOT_TOKEN || '').trim();\n  if (!token) throw new Error('YANDEX_BOT_TOKEN is not set');\n  if (!fileId) throw new Error('file_id is empty');\n\n  const body = Buffer.from(JSON.stringify({ file_id: fileId }), 'utf8');\n  const r1 = await httpRequestBuffer(\n    {\n      method: 'POST',\n      hostname: 'botapi.messenger.yandex.net',\n      path: '/bot/v1/messages/getFile/',\n      headers: {\n        'Authorization': `OAuth ${token}`,\n        'Content-Type': 'application/json',\n        'Content-Length': String(body.length),\n      },\n    },\n    body\n  );\n\n  if (looksLikeJson(r1.headers, r1.buf)) {\n    const err = extractYandexJsonError(r1.buf);\n    if (err) throw new Error(err);\n  }\n  if (r1.statusCode >= 200 && r1.statusCode < 300) return r1.buf;\n\n  const p = `/bot/v1/messages/getFile/?file_id=${encodeURIComponent(fileId)}`;\n  const r2 = await httpRequestBuffer(\n    {\n      method: 'GET',\n      hostname: 'botapi.messenger.yandex.net',\n      path: p,\n      headers: { 'Authorization': `OAuth ${token}` },\n    },\n    null\n  );\n\n  if (looksLikeJson(r2.headers, r2.buf)) {\n    const err = extractYandexJsonError(r2.buf);\n    if (err) throw new Error(err);\n  }\n  if (r2.statusCode >= 200 && r2.statusCode < 300) return r2.buf;\n\n  throw new Error(`getFile failed: POST=${r1.statusCode} GET=${r2.statusCode}`);\n}\n\nfunction extractJsonLoose(text) {\n  const t = String(text || '').trim()\n    .replace(/^```json\\s*/i, '')\n    .replace(/^```\\s*/i, '')\n    .replace(/```$/i, '')\n    .trim();\n  try { return JSON.parse(t); } catch {}\n  const m = t.match(/\\{[\\s\\S]*\\}/);\n  if (m) { try { return JSON.parse(m[0]); } catch {} }\n  return null;\n}\n\n// --- main ---\nconst fileId = s(base.file_id || base.fileId).trim();\nconst fileName = s(base.file_name || base.fileName || base.name || 'image').trim();\nconst ocrText = s(base.ocr_text || base.ocrText).trim();\n\nif (!fileId) {\n  return [{ json: { ...base, vlm_ok: false, vlm_error: 'file_id missing (no image chosen)' } }];\n}\n\nconst imgBuf = await yandexGetFileBuffer(fileId);\nconst imgB64 = imgBuf.toString('base64');\n\nconst prompt =\n`You are a document understanding assistant.\nTASK: Use the image as primary source. Use OCR text as a hint, but correct OCR mistakes using the image.\nReturn ONLY valid JSON (no markdown), UTF-8.\n\nJSON schema:\n{\n  \"lang\": \"ru|en|mixed\",\n  \"doc_type\": \"invoice|contract|act|letter|screenshot|table|other\",\n  \"normalized_text\": \"cleaned text, preserving structure and headings\",\n  \"key_values\": { \"key\": \"value\", \"...\": \"...\" },\n  \"tables\": [\n    { \"name\": \"Table1\", \"csv\": \"col1;col2\\\\n...\" }\n  ],\n  \"notes\": \"short, factual (no recommendations)\"\n}\n\nOCR_HINT (may contain errors):\n${ocrText ? ocrText.slice(0, 12000) : '(none)'}\n`;\n\nconst resp = await this.helpers.httpRequest({\n  method: 'POST',\n  url: `${OLLAMA_URL}/api/chat`,\n  json: true,\n  body: {\n    model: MODEL,\n    stream: false,\n    messages: [{\n      role: 'user',\n      content: prompt,\n      images: [imgB64],\n    }],\n  },\n  timeout: 3600000,\n});\n\nconst content = resp?.message?.content || '';\nconst obj = extractJsonLoose(content);\n\nreturn [{\n  json: {\n    ...base,\n    vlm_ok: true,\n    vlm_model: MODEL,\n    vlm_raw: content,\n    vlm_json: obj || null,\n    vlm_text: obj?.normalized_text || '',\n    vlm_tables: obj?.tables || [],\n    vlm_kv: obj?.key_values || {},\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2176,
+        -144
+      ],
+      "id": "6641919c-f7bf-411b-8693-e68c440e4b4d",
+      "name": "VLM Normalize (Qwen2.5-VL)"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prepare corp input — FULL REPLACE v1\n// Purpose:\n// - Take VLM output (vlm_json / vlm_text / vlm_tables / vlm_kv) + OCR text\n// - Build compact llm_input for corporate agent\n// - Force model to corp-assistant (or qwen2.5:72b-instruct-q5_K_M if you use direct model)\n// - Keep passthrough of chatId/login/files etc.\n//\n// Expected upstream fields (best-effort):\n// - base.lastUserText or base.userText or base.text\n// - base.ocr_text (optional)\n// - base.vlm_json / base.vlm_text / base.vlm_tables / base.vlm_kv\n//\n// Output fields used downstream:\n// - llm_input (string)\n// - model (corp-assistant:latest)\n// - wantsLogParsing=false\n// - hasImage/hasFile preserved\n\nfunction s(x){ return x == null ? '' : String(x); }\n\nfunction safeJson(x, maxLen = 14000) {\n  try {\n    const j = JSON.stringify(x, null, 2);\n    return j.length > maxLen ? j.slice(0, maxLen) + '\\n[TRUNCATED]' : j;\n  } catch {\n    return '';\n  }\n}\n\nfunction takeTables(vlmTables, maxTables = 4, maxCharsEach = 2500) {\n  const out = [];\n  const arr = Array.isArray(vlmTables) ? vlmTables : [];\n  for (const t of arr.slice(0, maxTables)) {\n    const name = s(t?.name || '').trim() || 'Table';\n    const csv = s(t?.csv || '').trim();\n    if (!csv) continue;\n    const body = csv.length > maxCharsEach ? csv.slice(0, maxCharsEach) + '\\n[TRUNCATED]' : csv;\n    out.push(`TABLE: ${name}\\nCSV (semicolon-separated):\\n${body}`);\n  }\n  return out.join('\\n\\n').trim();\n}\n\nconst items = $input.all();\nif (!items.length) return [];\n\n// Run Once for All Items: we will process each item, but typically there's 1\nfor (const item of items) {\n  const base = item.json || {};\n\n  const userReq =\n    s(base.lastUserText).trim() ||\n    s(base.userText).trim() ||\n    s(base.user_text).trim() ||\n    s(base.text).trim() ||\n    'Process the attached document.';\n\n  const ocrText = s(base.ocr_text).trim();\n  const vlmText = s(base.vlm_text).trim() || s(base.vlm_json?.normalized_text).trim();\n  const kv = base.vlm_kv || base.vlm_json?.key_values || null;\n  const docType = s(base.vlm_json?.doc_type || '').trim();\n  const lang = s(base.vlm_json?.lang || '').trim();\n  const tablesText = takeTables(base.vlm_tables || base.vlm_json?.tables);\n\n  // Compose corp llm_input (short, actionable)\n  const parts = [];\n  parts.push(`TASK (from user):\\n${userReq}`);\n\n  parts.push(`\\nDOCUMENT UNDERSTANDING (from VLM Qwen2.5-VL):`);\n  if (docType) parts.push(`- doc_type: ${docType}`);\n  if (lang) parts.push(`- lang: ${lang}`);\n\n  if (vlmText) {\n    parts.push(`\\nNORMALIZED TEXT:\\n${vlmText.slice(0, 12000)}${vlmText.length > 12000 ? '\\n[TRUNCATED]' : ''}`);\n  } else if (ocrText) {\n    // fallback if VLM didn't return normalized_text\n    parts.push(`\\nOCR TEXT (fallback):\\n${ocrText.slice(0, 12000)}${ocrText.length > 12000 ? '\\n[TRUNCATED]' : ''}`);\n  }\n\n  if (kv && Object.keys(kv).length) {\n    parts.push(`\\nKEY-VALUE (extracted):\\n${safeJson(kv, 8000)}`);\n  }\n\n  if (tablesText) {\n    parts.push(`\\nTABLES (extracted):\\n${tablesText}`);\n  }\n\n  parts.push(`\nINSTRUCTIONS:\n- Use the document content above as the single source of truth.\n- If the user asked to fill a table/CSV/Excel, produce a semicolon-separated CSV inside a fenced block:\n  \\`\\`\\`csv\n  ...\n  \\`\\`\\`\n- If the user asked to draft an email/contract/letter, produce a ready-to-send text.\n- If data is missing, ask exactly 1-3 clarification questions.\n`.trim());\n\n  const llm_input = parts.join('\\n').trim();\n\n  // Force corporate route\n  item.json = {\n    ...base,\n    model: 'corp-assistant:latest',\n    wantsLogParsing: false,\n    wantsTxt: false,\n    llm_input,\n    // (optional) keep debug\n    corp_input_debug: {\n      has_vlm: !!vlmText,\n      has_tables: !!tablesText,\n      doc_type: docType || null,\n      lang: lang || null,\n      llm_input_chars: llm_input.length,\n    },\n  };\n}\n\nreturn items;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2384,
+        -144
+      ],
+      "id": "17f5bea9-9b34-4021-aa0e-95c27d7b8e66",
+      "name": "Prepare corp input"
+    },
+    {
+      "parameters": {
+        "jsCode": "// OCR Request — FULL REPLACE v5 (Yandex getFile -> multipart image to OCR worker)\n// Input: file_id, file_name (from Prepare files for OCR)\n// Output: ok, ocr_text, text, file_id, file_name, ocr_debug, error_data\n// Env: YANDEX_BOT_TOKEN\n// Optional env:\n//   OCR_URL (default http://host.docker.internal:8000/ocr-image)\n//   OCR_URL_EN (default http://host.docker.internal:8000/ocr-image-en)\n\nconst https = require('https');\n\nconst base = $input.item.json || {};\nconst fileId = String(base.file_id || '').trim();\nconst fileName = String(base.file_name || 'image.png').trim() || 'image.png';\n\nconst OCR_URL = (String($env.OCR_URL || 'http://host.docker.internal:8000/ocr-image')).replace(/\\/$/, '');\nconst OCR_URL_EN = (String($env.OCR_URL_EN || 'http://host.docker.internal:8000/ocr-image-en')).replace(/\\/$/, '');\n\nfunction httpRequestBuffer({ method, hostname, path, headers }, bodyBuf) {\n  return new Promise((resolve, reject) => {\n    const req = https.request({ method, hostname, path, headers }, (res) => {\n      const chunks = [];\n      res.on('data', (d) => chunks.push(Buffer.isBuffer(d) ? d : Buffer.from(d)));\n      res.on('end', () => resolve({ statusCode: res.statusCode || 0, headers: res.headers || {}, buf: Buffer.concat(chunks) }));\n    });\n    req.on('error', reject);\n    if (bodyBuf && bodyBuf.length) req.write(bodyBuf);\n    req.end();\n  });\n}\n\nfunction looksLikeJson(headers, buf) {\n  const ct = String(headers?.['content-type'] || '').toLowerCase();\n  if (ct.includes('application/json')) return true;\n  const b0 = buf?.slice?.(0, 1)?.toString?.('utf8') || '';\n  return b0 === '{' || b0 === '[';\n}\n\nfunction extractYandexJsonError(buf) {\n  try {\n    const obj = JSON.parse(buf.toString('utf8'));\n    if (obj && obj.ok === false) return obj.description || obj.code || 'getFile failed';\n  } catch {}\n  return null;\n}\n\nasync function yandexGetFileBuffer(fid) {\n  const token = String($env?.YANDEX_BOT_TOKEN || '').trim();\n  if (!token) throw new Error('YANDEX_BOT_TOKEN is not set');\n  if (!fid) throw new Error('file_id is empty');\n\n  const body = Buffer.from(JSON.stringify({ file_id: fid }), 'utf8');\n  const r1 = await httpRequestBuffer(\n    {\n      method: 'POST',\n      hostname: 'botapi.messenger.yandex.net',\n      path: '/bot/v1/messages/getFile/',\n      headers: {\n        'Authorization': `OAuth ${token}`,\n        'Content-Type': 'application/json',\n        'Content-Length': String(body.length),\n      },\n    },\n    body\n  );\n\n  if (looksLikeJson(r1.headers, r1.buf)) {\n    const err = extractYandexJsonError(r1.buf);\n    if (err) throw new Error(err);\n  }\n  if (r1.statusCode >= 200 && r1.statusCode < 300) return r1.buf;\n\n  const p = `/bot/v1/messages/getFile/?file_id=${encodeURIComponent(fid)}`;\n  const r2 = await httpRequestBuffer(\n    { method: 'GET', hostname: 'botapi.messenger.yandex.net', path: p, headers: { 'Authorization': `OAuth ${token}` } },\n    null\n  );\n\n  if (looksLikeJson(r2.headers, r2.buf)) {\n    const err = extractYandexJsonError(r2.buf);\n    if (err) throw new Error(err);\n  }\n  if (r2.statusCode >= 200 && r2.statusCode < 300) return r2.buf;\n\n  throw new Error(`getFile failed: POST=${r1.statusCode} | GET=${r2.statusCode}`);\n}\n\nfunction guessMime(name) {\n  const n = String(name || '').toLowerCase();\n  if (n.endsWith('.png')) return 'image/png';\n  if (n.endsWith('.jpg') || n.endsWith('.jpeg')) return 'image/jpeg';\n  if (n.endsWith('.webp')) return 'image/webp';\n  return 'application/octet-stream';\n}\n\nif (!fileId) {\n  return [{ json: { ...base, ok: false, ocr_text: '', text: '', error: 'file_id missing' } }];\n}\n\n// 1) Download image\nlet imgBuf;\ntry {\n  imgBuf = await yandexGetFileBuffer(fileId);\n} catch (e) {\n  const msg = `Download image failed: ${e?.message || String(e)}`;\n  return [{ json: { ...base, ok: false, ocr_text: '', text: '', error: msg } }];\n}\n\n// 2) Choose RU/EN endpoint\nconst ocrLang = String(base.ocr_lang || '').toLowerCase();\nconst useEn = ocrLang.startsWith('en') || base.forceOcrEn === true;\nconst url = useEn ? OCR_URL_EN : OCR_URL;\n\n// 3) Send multipart (n8n helper)\nconst mime = guessMime(fileName);\n\ntry {\n  const resp = await this.helpers.httpRequest({\n    method: 'POST',\n    url,\n    // IMPORTANT: multipart field name MUST be \"image\"\n    formData: {\n      // optional lang for /ocr-image (RU). /ocr-image-en ignores it safely.\n      ...(useEn ? {} : { lang: 'ru' }),\n      image: {\n        value: imgBuf,\n        options: { filename: fileName, contentType: mime },\n      },\n    },\n    timeout: 120000,\n    json: true,\n  });\n\n  const text =\n    (resp && typeof resp.text === 'string') ? resp.text :\n    (resp && typeof resp.ocr_text === 'string') ? resp.ocr_text :\n    JSON.stringify(resp);\n\n  const cleaned = String(text || '').trim();\n\n  return [{\n    json: {\n      ...base,\n      ok: resp?.ok === true && cleaned.length > 0,\n      ocr_text: cleaned,\n      text: cleaned,\n      file_id: fileId,\n      file_name: fileName,\n      ocr_debug: { url, bytes: imgBuf.length, mime, resp_ok: resp?.ok },\n    }\n  }];\n} catch (e) {\n  const status = e?.response?.status ?? e?.statusCode ?? '';\n  let dataStr = '';\n  try { dataStr = e?.response?.data ? JSON.stringify(e.response.data) : ''; } catch { dataStr = String(e?.response?.data || ''); }\n  const msg = `OCR HTTP failed status=${status} ${e?.message || e}`;\n  return [{\n    json: {\n      ...base,\n      ok: false,\n      ocr_text: '',\n      text: '',\n      error: msg,\n      error_data: dataStr,\n      ocr_debug: { url, bytes: imgBuf.length, mime },\n    }\n  }];\n}\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1824,
+        -144
+      ],
+      "id": "3223eb25-ac16-4f18-9a0f-0a49c994373b",
+      "name": "OCR Request"
+    }
+  ],
+  "pinData": {
+    "Webhook": [
+      {
+        "json": {
+          "headers": {
+            "connection": "upgrade",
+            "host": "n8n.itcost.ru",
+            "x-real-ip": "10.10.200.1",
+            "x-forwarded-for": "10.10.200.1",
+            "x-forwarded-proto": "https",
+            "content-length": "375",
+            "user-agent": "Mozilla/5.0 (compatible; YandexUserproxy; robot; +http://yandex.com/bots)",
+            "accept-encoding": "gzip, x-gzip, deflate",
+            "content-type": "application/json; charset=UTF-8"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "updates": [
+              {
+                "message_id": 1763730909592004,
+                "timestamp": 1763730909,
+                "chat": {
+                  "type": "private"
+                },
+                "from": {
+                  "id": "360eed3e-84b1-40cd-8af5-f9042df164ad",
+                  "display_name": "Кузин Евгений",
+                  "login": "kuzin@itcost.ru",
+                  "robot": false
+                },
+                "update_id": 1763730909592004,
+                "text": "Как сам?"
+              }
+            ]
+          },
+          "webhookUrl": "http://localhost:5678/webhook/Assistbot",
+          "executionMode": "production"
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Extract message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract message": {
+      "main": [
+        [
+          {
+            "node": "Data message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare reply": {
+      "main": [
+        [
+          {
+            "node": "If file",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "Read messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Data message": {
+      "main": [
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read messages": {
+      "main": [
+        [
+          {
+            "node": "Prepare prompt & leader",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update row(s)": {
+      "main": [
+        []
+      ]
+    },
+    "If  leader": {
+      "main": [
+        [
+          {
+            "node": "Update row(s)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Files go OCR",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Stop",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare prompt & leader": {
+      "main": [
+        [
+          {
+            "node": "If  leader",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare files for OCR": {
+      "main": [
+        [
+          {
+            "node": "OCR Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge OCR results": {
+      "main": [
+        [
+          {
+            "node": "VLM Normalize (Qwen2.5-VL)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Text": {
+      "main": [
+        []
+      ]
+    },
+    "If file": {
+      "main": [
+        [
+          {
+            "node": "Send file",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send file": {
+      "main": [
+        []
+      ]
+    },
+    "Files go OCR": {
+      "main": [
+        [
+          {
+            "node": "Prepare files for OCR",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Corp Search Agent (iterative)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Corp Search Agent (iterative)": {
+      "main": [
+        [
+          {
+            "node": "Prepare reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "VLM Normalize (Qwen2.5-VL)": {
+      "main": [
+        [
+          {
+            "node": "Prepare corp input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare corp input": {
+      "main": [
+        [
+          {
+            "node": "Corp Search Agent (iterative)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OCR Request": {
+      "main": [
+        [
+          {
+            "node": "Merge OCR results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stop": {
+      "main": [
+        []
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/Moscow",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  },
+  "versionId": "bb253fd9-59da-4dcd-8865-4afc4d546f44",
+  "meta": {
+    "instanceId": "b7aa380705656969fa39759e0868f4a2cdd733e71248db37848cd014e207c2bc"
+  },
+  "id": "zDJ84yp2QOfS9NiB",
+  "tags": []
+}
